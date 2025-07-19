@@ -4,9 +4,12 @@ go 1.23.10
 
 require (
 	github.com/beevik/etree v1.5.1
+	github.com/google/uuid v1.6.0
 	github.com/joho/godotenv v1.5.1
 	github.com/jung-kurt/gofpdf v1.16.2
 	github.com/russellhaering/goxmldsig v1.5.0
+	gorm.io/driver/mysql v1.5.7
+	gorm.io/gorm v1.25.12
 	software.sslmate.com/src/go-pkcs12 v0.5.0
 )
 
