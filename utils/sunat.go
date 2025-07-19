@@ -11,6 +11,7 @@ import (
     "net/http"
     "os"
     "path/filepath"
+    "ubl-go-conversor/models"
 )
 
 // Paso 3: Crear ZIP con el XML firmado
@@ -74,12 +75,26 @@ func BuildSOAP(ruc, usuario, clave, zipPath string) (string, error) {
     return soap, nil
 }
 
-// Paso 5 y 6: Enviar a SUNAT y procesar respuesta
+// Paso 5 y 6: Enviar a SUNAT y procesar respuesta - Retorna JSON string (legacy)
 func SendToSunat(endpoint, soap, xmlZipName, baseCDRDir string) (string, error) {
+    cdrInfo, err := SendToSunatStructured(endpoint, soap, xmlZipName, baseCDRDir)
+    if err != nil {
+        return "", err
+    }
+    
+    return fmt.Sprintf(`{
+  "estado": "%s",
+  "codigo": "%s",
+  "mensaje": "%s"
+}`, cdrInfo.Estado, cdrInfo.ResponseCode, cdrInfo.Description), nil
+}
+
+// SendToSunatStructured - Nueva función que retorna información estructurada
+func SendToSunatStructured(endpoint, soap, xmlZipName, baseCDRDir string) (*models.CDRInfo, error) {
     client := &http.Client{}
     req, err := http.NewRequest("POST", endpoint, bytes.NewBufferString(soap))
     if err != nil {
-        return "", err
+        return nil, err
     }
 
     req.Header.Set("Content-Type", `text/xml; charset="utf-8"`)
@@ -87,13 +102,13 @@ func SendToSunat(endpoint, soap, xmlZipName, baseCDRDir string) (string, error) 
 
     resp, err := client.Do(req)
     if err != nil {
-        return "", err
+        return nil, err
     }
     defer resp.Body.Close()
 
     bodyBytes, err := io.ReadAll(resp.Body)
     if err != nil {
-        return "", err
+        return nil, err
     }
 
     type Envelope struct {
@@ -105,52 +120,59 @@ func SendToSunat(endpoint, soap, xmlZipName, baseCDRDir string) (string, error) 
 
     var envelope Envelope
     if err := xml.Unmarshal(bodyBytes, &envelope); err != nil {
-        return "", fmt.Errorf("error al parsear respuesta XML: %v", err)
+        return nil, fmt.Errorf("error al parsear respuesta XML: %v", err)
     }
 
     if envelope.FaultCode != "" {
-        return fmt.Sprintf(`{"estado":"error","codigo":"%s","mensaje":"%s"}`, envelope.FaultCode, envelope.FaultString), nil
+        return &models.CDRInfo{
+            ResponseCode: envelope.FaultCode,
+            Description:  envelope.FaultString,
+            Estado:       "error",
+        }, nil
     }
 
     decodedZip, err := base64.StdEncoding.DecodeString(envelope.ApplicationResponse)
     if err != nil {
-        return "", fmt.Errorf("error al decodificar base64: %v", err)
+        return nil, fmt.Errorf("error al decodificar base64: %v", err)
     }
 
     zipBaseName := removeExtension(filepath.Base(xmlZipName)) 
     cdrDir := filepath.Join(baseCDRDir, zipBaseName)
 
     if err := os.MkdirAll(cdrDir, 0755); err != nil {
-        return "", fmt.Errorf("error al crear carpeta CDR: %v", err)
+        return nil, fmt.Errorf("error al crear carpeta CDR: %v", err)
     }
 
     zipFileName := "CDR-" + filepath.Base(xmlZipName)
     zipFilePath := filepath.Join(cdrDir, zipFileName)
     if err := os.WriteFile(zipFilePath, decodedZip, 0644); err != nil {
-        return "", fmt.Errorf("error al guardar ZIP de respuesta: %v", err)
+        return nil, fmt.Errorf("error al guardar ZIP de respuesta: %v", err)
     }
+
+    // Convertir CDR ZIP a base64 para la respuesta
+    cdrZipBase64 := base64.StdEncoding.EncodeToString(decodedZip)
 
     zipReader, err := zip.NewReader(bytes.NewReader(decodedZip), int64(len(decodedZip)))
     if err != nil {
-        return "", fmt.Errorf("error al leer ZIP: %v", err)
+        return nil, fmt.Errorf("error al leer ZIP: %v", err)
     }
 
     for _, file := range zipReader.File {
         if ext := filepath.Ext(file.Name); ext == ".XML" || ext == ".xml" {
             rc, err := file.Open()
             if err != nil {
-                return "", err
+                return nil, err
             }
             defer rc.Close()
 
             content, err := io.ReadAll(rc)
             if err != nil {
-                return "", err
+                return nil, err
             }
 
             cdrXmlPath := filepath.Join(cdrDir, file.Name)
             if err := os.WriteFile(cdrXmlPath, content, 0644); err != nil {
-                return "", fmt.Errorf("error al guardar XML del CDR: %v", err)
+                return nil, fmt.Errorf("error al guardar XML del CDR: %v", err)
             }
 
             type CDR struct {
@@ -160,23 +182,27 @@ func SendToSunat(endpoint, soap, xmlZipName, baseCDRDir string) (string, error) 
 
             var cdr CDR
             if err := xml.Unmarshal(content, &cdr); err != nil {
-                return "", fmt.Errorf("error al parsear CDR: %v", err)
+                return nil, fmt.Errorf("error al parsear CDR: %v", err)
             }
 
             estado := "rechazada"
             if cdr.ResponseCode == "0" {
                 estado = "aprobada"
+            } else if cdr.ResponseCode >= "4000" && cdr.ResponseCode < "5000" {
+                estado = "observada"
             }
 
-            return fmt.Sprintf(`{
-  "estado": "%s",
-  "codigo": "%s",
-  "mensaje": "%s"
-}`, estado, cdr.ResponseCode, cdr.Description), nil
+            return &models.CDRInfo{
+                ResponseCode: cdr.ResponseCode,
+                Description:  cdr.Description,
+                Estado:       estado,
+                CDRZipBase64: cdrZipBase64,
+                CDRZipPath:   zipFilePath,
+            }, nil
         }
     }
 
-    return "", fmt.Errorf("no se encontró XML dentro del ZIP del CDR")
+    return nil, fmt.Errorf("no se encontró XML dentro del ZIP del CDR")
 }
 
 

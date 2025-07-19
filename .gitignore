@@ -1,0 +1,36 @@
+# Variables de entorno
+.env
+.env.local
+.env.production
+
+# Archivos de salida
+out/
+cdr/
+*.xml
+*.zip
+
+# Certificados (mantener solo los de prueba)
+certificados/*.pfx
+!certificados/certificado_prueba.pfx
+
+# Archivos de Go
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+# Archivos de IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Archivos temporales
+tmp/
+temp/
