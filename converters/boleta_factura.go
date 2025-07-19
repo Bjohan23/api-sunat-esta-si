@@ -1,4 +1,23 @@
-// Archivo: converters/ubl_factura_boleta.go
+/*
+Conversor de Facturas y Boletas a XML UBL 2.1 para SUNAT
+=======================================================
+
+Este paquete es el núcleo de la generación de XML siguiendo el estándar UBL 2.1
+con las extensiones específicas de SUNAT para facturación electrónica en Perú.
+
+Funciones principales:
+1. ConvertirFacturaAUBL() - Transforma ComprobanteBase a estructura UBL
+2. GenerarXMLBF() - Serializa la estructura UBL a archivo XML válido
+3. Funciones de mapeo para cada sección del documento UBL
+
+Cumple con:
+- UBL 2.1 (Universal Business Language)
+- Extensiones SUNAT (UBLExtensions)
+- Catálogos oficiales SUNAT
+- Validaciones de estructura XML
+
+El XML generado es válido para envío directo a SUNAT después de la firma digital.
+*/
 package converters
 
 import (
@@ -10,38 +29,70 @@ import (
 	"ubl-go-conversor/models"
 )
 
+/*
+Invoice representa la estructura raíz del documento UBL 2.1 para facturas y boletas.
+Esta estructura mapea directamente al XML que se envía a SUNAT.
+
+Componentes principales:
+- Namespaces: Definen los esquemas XML utilizados (UBL, SUNAT, XMLDSig)
+- UBLExtensions: Extensiones específicas de SUNAT (firma digital, percepciones)
+- Datos básicos: ID, fechas, tipo de documento, moneda
+- Partes: Emisor (AccountingSupplierParty) y Cliente (AccountingCustomerParty)
+- Totales: Impuestos (TaxTotal) y montos finales (LegalMonetaryTotal)
+- Líneas: Detalle de productos/servicios (InvoiceLines)
+
+Todos los elementos siguen la nomenclatura UBL estándar con prefijos:
+- cbc: CommonBasicComponents (elementos simples)
+- cac: CommonAggregateComponents (elementos complejos)
+- ext: ExtensionComponents (extensiones)
+*/
 type Invoice struct {
 	XMLName                 xml.Name                `xml:"Invoice"`
-	XmlnsXsi                string                  `xml:"xmlns:xsi,attr"`
-	XmlnsXsd                string                  `xml:"xmlns:xsd,attr"`
-	XmlnsCac                string                  `xml:"xmlns:cac,attr"`
-	XmlnsCbc                string                  `xml:"xmlns:cbc,attr"`
-	XmlnsCcts               string                  `xml:"xmlns:ccts,attr"`
-	XmlnsDs                 string                  `xml:"xmlns:ds,attr"`
-	XmlnsExt                string                  `xml:"xmlns:ext,attr"`
-	XmlnsQdt                string                  `xml:"xmlns:qdt,attr"`
-	XmlnsUdt                string                  `xml:"xmlns:udt,attr"`
-	XmlnsSac                string                  `xml:"xmlns:sac,attr"`
-	Xmlns                   string                  `xml:"xmlns,attr"`
-	UBLExtensions           UBLExtensions           `xml:"ext:UBLExtensions"`
-	UBLVersionID            string                  `xml:"cbc:UBLVersionID"`
-	CustomizationID         CustomizationID         `xml:"cbc:CustomizationID"`
-	ProfileID               ProfileID               `xml:"cbc:ProfileID"`
-	ID                      string                  `xml:"cbc:ID"`
-	IssueDate               string                  `xml:"cbc:IssueDate"`
-	IssueTime               string                  `xml:"cbc:IssueTime"`
-	DueDate                 string                  `xml:"cbc:DueDate,omitempty"`
-	InvoiceTypeCode         InvoiceTypeCode         `xml:"cbc:InvoiceTypeCode"`
-	Notes                   []Note                  `xml:"cbc:Note,omitempty"`
-	DocumentCurrencyCode    DocumentCurrencyCode    `xml:"cbc:DocumentCurrencyCode"`
-	LineCountNumeric        int                     `xml:"cbc:LineCountNumeric"`
-	Signature               Signature               `xml:"cac:Signature"`
-	AccountingSupplierParty AccountingSupplierParty `xml:"cac:AccountingSupplierParty"`
-	AccountingCustomerParty AccountingCustomerParty `xml:"cac:AccountingCustomerParty"`
-	PaymentTerms            []PaymentTerms          `xml:"cac:PaymentTerms,omitempty"`
-	TaxTotal                []TaxTotal              `xml:"cac:TaxTotal"`
-	LegalMonetaryTotal      LegalMonetaryTotal      `xml:"cac:LegalMonetaryTotal"`
-	InvoiceLines            []InvoiceLine           `xml:"cac:InvoiceLine"`
+	// ==================== NAMESPACES XML ====================
+	XmlnsXsi                string                  `xml:"xmlns:xsi,attr"`    // XML Schema Instance
+	XmlnsXsd                string                  `xml:"xmlns:xsd,attr"`    // XML Schema Definition
+	XmlnsCac                string                  `xml:"xmlns:cac,attr"`    // Common Aggregate Components
+	XmlnsCbc                string                  `xml:"xmlns:cbc,attr"`    // Common Basic Components
+	XmlnsCcts               string                  `xml:"xmlns:ccts,attr"`   // Core Component Technical Specification
+	XmlnsDs                 string                  `xml:"xmlns:ds,attr"`     // XML Digital Signature
+	XmlnsExt                string                  `xml:"xmlns:ext,attr"`    // Extension Components
+	XmlnsQdt                string                  `xml:"xmlns:qdt,attr"`    // Qualified Data Types
+	XmlnsUdt                string                  `xml:"xmlns:udt,attr"`    // Unqualified Data Types
+	XmlnsSac                string                  `xml:"xmlns:sac,attr"`    // SUNAT Aggregate Components
+	Xmlns                   string                  `xml:"xmlns,attr"`        // Default namespace
+	
+	// ==================== EXTENSIONES SUNAT ====================
+	UBLExtensions           UBLExtensions           `xml:"ext:UBLExtensions"` // Contenedor para firma digital y percepciones
+	
+	// ==================== INFORMACIÓN BÁSICA DEL DOCUMENTO ====================
+	UBLVersionID            string                  `xml:"cbc:UBLVersionID"`    // Versión UBL (2.1)
+	CustomizationID         CustomizationID         `xml:"cbc:CustomizationID"` // Versión de implementación SUNAT
+	ProfileID               ProfileID               `xml:"cbc:ProfileID"`       // Tipo de operación (catálogo 51)
+	ID                      string                  `xml:"cbc:ID"`              // Serie-Número del comprobante
+	IssueDate               string                  `xml:"cbc:IssueDate"`       // Fecha de emisión (YYYY-MM-DD)
+	IssueTime               string                  `xml:"cbc:IssueTime"`       // Hora de emisión (HH:MM:SS)
+	DueDate                 string                  `xml:"cbc:DueDate,omitempty"` // Fecha de vencimiento (opcional)
+	InvoiceTypeCode         InvoiceTypeCode         `xml:"cbc:InvoiceTypeCode"` // Tipo de documento (01=Factura, 03=Boleta)
+	Notes                   []Note                  `xml:"cbc:Note,omitempty"`  // Leyendas (importes en letras, etc.)
+	DocumentCurrencyCode    DocumentCurrencyCode    `xml:"cbc:DocumentCurrencyCode"` // Moneda (PEN, USD, EUR)
+	LineCountNumeric        int                     `xml:"cbc:LineCountNumeric"`     // Cantidad de líneas de detalle
+	
+	// ==================== FIRMA DIGITAL ====================
+	Signature               Signature               `xml:"cac:Signature"`       // Información del certificado digital
+	
+	// ==================== PARTES DEL DOCUMENTO ====================
+	AccountingSupplierParty AccountingSupplierParty `xml:"cac:AccountingSupplierParty"` // Datos del emisor
+	AccountingCustomerParty AccountingCustomerParty `xml:"cac:AccountingCustomerParty"` // Datos del cliente
+	
+	// ==================== CONDICIONES DE PAGO ====================
+	PaymentTerms            []PaymentTerms          `xml:"cac:PaymentTerms,omitempty"` // Forma de pago y cuotas
+	
+	// ==================== TOTALES E IMPUESTOS ====================
+	TaxTotal                []TaxTotal              `xml:"cac:TaxTotal"`       // Resumen de impuestos (IGV)
+	LegalMonetaryTotal      LegalMonetaryTotal      `xml:"cac:LegalMonetaryTotal"` // Totales monetarios finales
+	
+	// ==================== DETALLE DE LÍNEAS ====================
+	InvoiceLines            []InvoiceLine           `xml:"cac:InvoiceLine"`    // Productos/servicios vendidos
 }
 
 type Note struct {
@@ -107,23 +158,42 @@ type Price struct {
 	PriceAmount AmountWithCurrency `xml:"cbc:PriceAmount"`
 }
 
-// ============================ FUNCIÓN PRINCIPAL ============================
+/*
+============================ FUNCIÓN PRINCIPAL DE CONVERSIÓN ============================
+
+ConvertirFacturaAUBL transforma un ComprobanteBase (estructura interna) a Invoice (estructura UBL).
+Esta es la función núcleo que mapea todos los datos del comprobante peruano al estándar internacional UBL 2.1.
+
+Proceso de conversión:
+1. Configurar parámetros base (profileID, extensiones)
+2. Mapear leyendas del comprobante a elementos Note
+3. Crear extensiones UBL requeridas por SUNAT
+4. Construir estructura Invoice completa con todos sus componentes
+5. Aplicar namespaces y versiones UBL correctas
+
+El resultado es una estructura Invoice lista para serializar a XML válido.
+*/
 func ConvertirFacturaAUBL(f models.ComprobanteBase) Invoice {
+	// Tipo de operación según catálogo 51 de SUNAT
+	// 0101 = Venta interna (operación más común)
 	profileID := "0101"
+	
+	// Convertir leyendas del comprobante (ej: importe en letras) a elementos UBL Note
 	notes := []Note{}
 	for _, leyenda := range f.Leyendas {
 		notes = append(notes, Note{
-			Value:            leyenda.Descripcion,
-			LanguageLocaleID: leyenda.Codigo,
+			Value:            leyenda.Descripcion, // Texto de la leyenda
+			LanguageLocaleID: leyenda.Codigo,      // Código de tipo de leyenda (catálogo 52)
 		})
 	}
 
-	// Crear todas las extensiones necesarias
+	// ==================== EXTENSIONES UBL PARA SUNAT ====================
 	var extensiones []UBLExtension
 
-	// 1. Extension vacía para firma digital (requerida por SUNAT)
+	// 1. Extensión vacía obligatoria para firma digital
+	//    SUNAT requiere esta extensión para insertar la firma XMLDSig
 	extensiones = append(extensiones, UBLExtension{
-		ExtensionContent: ExtensionContent{},
+		ExtensionContent: ExtensionContent{}, // Contenido vacío, se llena al firmar
 	})
 
 	// 2. Si hay percepción, se agrega como otra extensión

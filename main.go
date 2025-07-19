@@ -1,3 +1,33 @@
+/*
+API de Facturación Electrónica para SUNAT - Perú
+===============================================
+
+Este es el punto de entrada principal de la API REST que maneja la generación,
+firma digital y envío de comprobantes electrónicos (facturas y boletas) a SUNAT
+siguiendo el estándar UBL 2.1 con extensiones SUNAT.
+
+Flujo principal:
+1. Recibe JSON con datos del comprobante
+2. Valida datos según normativas SUNAT
+3. Genera XML UBL 2.1 con extensiones SUNAT
+4. Firma digitalmente el XML usando certificado PKCS#12
+5. Comprime el XML firmado en ZIP
+6. Construye mensaje SOAP para SUNAT
+7. Envía a SUNAT y procesa respuesta CDR
+8. Genera PDF de representación impresa
+9. Almacena todo en base de datos con auditoría
+10. Retorna respuesta estructurada al cliente
+
+Arquitectura:
+- config: Configuración externa (BD, SUNAT, certificados)
+- models: Estructuras de datos (comprobantes, respuestas, BD)
+- validators: Validaciones de negocio según SUNAT
+- converters: Generación de XML UBL 2.1
+- signature: Firma digital con certificados X.509
+- utils: Comunicación SOAP con SUNAT
+- database: Persistencia y auditoría
+- pdf: Generación de representación impresa
+*/
 package main
 
 import (
@@ -20,27 +50,35 @@ import (
 	"ubl-go-conversor/validator"
 )
 
-var appConfig *config.Config
-var docRepo *repository.DocumentRepository
-var auditRepo *repository.AuditRepository
+// Variables globales para configuración y repositorios
+// Estas se inicializan una vez al arrancar la aplicación
+var appConfig *config.Config           // Configuración de la aplicación (.env)
+var docRepo *repository.DocumentRepository // Repositorio para operaciones de documentos
+var auditRepo *repository.AuditRepository   // Repositorio para logs de auditoría
 
+// main es el punto de entrada de la aplicación
+// Inicializa todos los componentes necesarios y arranca el servidor HTTP
 func main() {
-	// Cargar configuración
+	// PASO 1: Cargar configuración desde .env y variables de entorno
 	appConfig = config.Load()
 	
-	// Inicializar base de datos
+	// PASO 2: Inicializar conexión a MySQL y crear tablas si no existen
 	if err := database.Initialize(appConfig); err != nil {
 		log.Fatal("Error inicializando base de datos:", err)
 	}
 	
-	// Inicializar repositorios
+	// PASO 3: Inicializar repositorios para operaciones de base de datos
 	db := database.GetDB()
 	docRepo = repository.NewDocumentRepository(db)
 	auditRepo = repository.NewAuditRepository(db)
 	
+	// PASO 4: Configurar rutas HTTP
+	// POST /api/v1/invoices - Endpoint principal para crear facturas/boletas
 	http.HandleFunc("/api/v1/invoices", manerjarDocumento)
+	// GET /api/v1/documents/{id}/{action} - Endpoints para consultar documentos
 	http.HandleFunc("/api/v1/documents/", manerjarDocumentos)
 	
+	// PASO 5: Arrancar servidor HTTP
 	serverAddr := ":" + appConfig.Server.Port
 	fmt.Printf("Servidor iniciado en http://%s%s\n", appConfig.Server.Host, serverAddr)
 	
@@ -50,12 +88,34 @@ func main() {
 	}
 }
 
+/*
+manerjarDocumento es el endpoint principal que procesa facturas y boletas electrónicas
+Implementa el flujo completo desde la recepción del JSON hasta el envío a SUNAT
+
+Proceso de 6 pasos según normativa SUNAT:
+1. Validación de datos de entrada
+2. Generación de XML UBL 2.1 
+3. Firma digital del XML
+4. Compresión en ZIP
+5. Construcción de mensaje SOAP
+6. Envío a SUNAT y procesamiento de CDR
+
+Además incluye:
+- Persistencia en base de datos con auditoría
+- Generación de PDF de representación impresa
+- Respuesta estructurada según requerimientos
+*/
 func manerjarDocumento(w http.ResponseWriter, r *http.Request) {
+	// ==================== VALIDACIÓN DE ENTRADA ====================
+	
+	// Solo acepta método POST para crear documentos
 	if r.Method != http.MethodPost {
 		http.Error(w, "Método no permitido", http.StatusMethodNotAllowed)
 		return
 	}
 
+	// Parsear JSON del request a estructura ComprobanteBase
+	// Esta estructura contiene todos los datos necesarios para generar la factura/boleta
 	var documento models.ComprobanteBase
 	err := json.NewDecoder(r.Body).Decode(&documento)
 	if err != nil {
@@ -63,35 +123,47 @@ func manerjarDocumento(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validar datos según normativas SUNAT (RUC, series, totales, etc.)
+	// El validator verifica reglas de negocio específicas de facturación electrónica
 	err = validator.ValidarComprobanteBase(documento)
 	if err != nil {
 		http.Error(w, "Error de validación: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Crear documento en base de datos
+	// ==================== PERSISTENCIA INICIAL ====================
+	
+	// Generar ID único del documento: RUC-TipoDoc-Serie-Numero
+	// Ejemplo: "20123456789-01-F001-00000123"
 	documentID := models.GenerateDocumentID(documento.Emisor.RUC, documento.TipoDocumento, documento.Serie, documento.Numero)
+	
+	// Crear registro inicial en base de datos con estado "processing"
+	// Esto permite rastrear el documento desde el inicio del proceso
 	dbDocument := &models.Document{
-		ID:         documentID,
-		RUC:        documento.Emisor.RUC,
-		TipoDoc:    documento.TipoDocumento,
-		Serie:      documento.Serie,
-		Numero:     documento.Numero,
-		Cliente:    documento.Cliente.RazonSocial,
-		ClienteDoc: documento.Cliente.NumeroDoc,
-		Total:      documento.TotalImportePagar,
-		Moneda:     documento.Moneda,
-		Estado:     models.StatusProcessing,
+		ID:         documentID,           // ID único del documento
+		RUC:        documento.Emisor.RUC, // RUC del emisor
+		TipoDoc:    documento.TipoDocumento, // 01=Factura, 03=Boleta
+		Serie:      documento.Serie,      // Serie del comprobante (F001, B001)
+		Numero:     documento.Numero,     // Número correlativo
+		Cliente:    documento.Cliente.RazonSocial, // Nombre/razón social del cliente
+		ClienteDoc: documento.Cliente.NumeroDoc,   // DNI/RUC del cliente
+		Total:      documento.TotalImportePagar,   // Importe total a pagar
+		Moneda:     documento.Moneda,     // PEN, USD, EUR
+		Estado:     models.StatusProcessing, // Estado inicial: "processing"
 	}
 	
+	// Guardar en base de datos - si falla, abortar proceso
 	if err := docRepo.Create(dbDocument); err != nil {
 		http.Error(w, "Error al crear documento en BD: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	
-	// Log de auditoría - creación
+	// Registrar acción de creación en logs de auditoría
 	auditRepo.CreateLog(documentID, repository.ActionCreated, "Documento creado", r.RemoteAddr)
 
+	// ==================== PASO 1: GENERACIÓN DE XML UBL 2.1 ====================
+	
+	// Crear directorio de salida si no existe
 	if _, err := os.Stat("out"); os.IsNotExist(err) {
 		err = os.Mkdir("out", 0755)
 		if err != nil {
@@ -100,10 +172,16 @@ func manerjarDocumento(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Generar nombre del archivo XML con formato estándar SUNAT
+	// Formato: RUC-TipoDocumento-Serie-Numero.xml
+	// Ejemplo: "20123456789-01-F001-00000123.xml"
 	nombreXML := fmt.Sprintf("out/%s-%s-%s-%s.xml", documento.Emisor.RUC, documento.TipoDocumento, documento.Serie, documento.Numero)
 
-	// Paso 1: Generar XML
+	// Generar XML UBL 2.1 según el tipo de documento
+	// Solo soporta facturas (01) y boletas (03) por ahora
 	if documento.TipoDocumento == "01" || documento.TipoDocumento == "03" {
+		// El conversor transforma la estructura ComprobanteBase a XML UBL 2.1
+		// Incluye todas las extensiones SUNAT requeridas y validaciones de estructura
 		err = conversor.GenerarXMLBF(documento, nombreXML)
 		if err != nil {
 			http.Error(w, "Error al generar XML: "+err.Error(), http.StatusInternalServerError)
@@ -111,22 +189,31 @@ func manerjarDocumento(w http.ResponseWriter, r *http.Request) {
 		}
 		fmt.Printf("PASO 1: XML generado exitosamente: %s\n", nombreXML)
 	} else {
+		// Rechazar tipos de documento no implementados (notas de crédito/débito)
 		http.Error(w, "Tipo de documento no soportado: "+documento.TipoDocumento, http.StatusBadRequest)
 		return
 	}
 
-	// Paso 2: Firmar XML
-	digest, signatureValue, err := signature.FirmaXML(nombreXML, appConfig.Certificate.Path, appConfig.Certificate.Password)
+	// ==================== PASO 2: FIRMA DIGITAL ====================
+	
+	// Firmar XML usando certificado digital PKCS#12
+	// La firma cumple con estándares XMLDSig y normativas SUNAT
+	// Retorna: digest (SHA1) y signatureValue (RSA)
+	digest, signatureValue, err := signature.FirmaXML(
+		nombreXML,                    // Archivo XML a firmar
+		appConfig.Certificate.Path,   // Ruta del certificado .pfx
+		appConfig.Certificate.Password, // Contraseña del certificado
+	)
 	if err != nil {
 		http.Error(w, "Error al firmar XML: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	fmt.Println("PASO 2: XML firmado correctamente.")
-	fmt.Println("Hash SHA1 (DigestValue):", digest)
-	fmt.Println("Firma RSA (SignatureValue):", signatureValue)
+	fmt.Println("Hash SHA1 (DigestValue):", digest)        // Hash del contenido firmado
+	fmt.Println("Firma RSA (SignatureValue):", signatureValue) // Firma digital RSA
 	
-	// Actualizar hashes en BD
+	// Guardar hashes de la firma en base de datos para auditoría
 	docRepo.UpdateHashes(documentID, digest, signatureValue)
 	auditRepo.CreateLog(documentID, repository.ActionSigned, "XML firmado digitalmente", r.RemoteAddr)
 	// Paso 3: Comprimir ZIP
