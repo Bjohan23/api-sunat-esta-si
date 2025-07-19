@@ -11,18 +11,32 @@ import (
 
 	"ubl-go-conversor/config"
 	conversor "ubl-go-conversor/converters"
+	"ubl-go-conversor/database"
 	"ubl-go-conversor/models"
 	"ubl-go-conversor/pdf"
+	"ubl-go-conversor/repository"
 	"ubl-go-conversor/signature"
 	"ubl-go-conversor/utils"
 	"ubl-go-conversor/validator"
 )
 
 var appConfig *config.Config
+var docRepo *repository.DocumentRepository
+var auditRepo *repository.AuditRepository
 
 func main() {
 	// Cargar configuración
 	appConfig = config.Load()
+	
+	// Inicializar base de datos
+	if err := database.Initialize(appConfig); err != nil {
+		log.Fatal("Error inicializando base de datos:", err)
+	}
+	
+	// Inicializar repositorios
+	db := database.GetDB()
+	docRepo = repository.NewDocumentRepository(db)
+	auditRepo = repository.NewAuditRepository(db)
 	
 	http.HandleFunc("/api/v1/invoices", manerjarDocumento)
 	http.HandleFunc("/api/v1/documents/", manerjarDocumentos)
@@ -54,6 +68,29 @@ func manerjarDocumento(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error de validación: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	// Crear documento en base de datos
+	documentID := models.GenerateDocumentID(documento.Emisor.RUC, documento.TipoDocumento, documento.Serie, documento.Numero)
+	dbDocument := &models.Document{
+		ID:         documentID,
+		RUC:        documento.Emisor.RUC,
+		TipoDoc:    documento.TipoDocumento,
+		Serie:      documento.Serie,
+		Numero:     documento.Numero,
+		Cliente:    documento.Cliente.RazonSocial,
+		ClienteDoc: documento.Cliente.NumeroDoc,
+		Total:      documento.TotalImportePagar,
+		Moneda:     documento.Moneda,
+		Estado:     models.StatusProcessing,
+	}
+	
+	if err := docRepo.Create(dbDocument); err != nil {
+		http.Error(w, "Error al crear documento en BD: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	
+	// Log de auditoría - creación
+	auditRepo.CreateLog(documentID, repository.ActionCreated, "Documento creado", r.RemoteAddr)
 
 	if _, err := os.Stat("out"); os.IsNotExist(err) {
 		err = os.Mkdir("out", 0755)
@@ -88,6 +125,10 @@ func manerjarDocumento(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("PASO 2: XML firmado correctamente.")
 	fmt.Println("Hash SHA1 (DigestValue):", digest)
 	fmt.Println("Firma RSA (SignatureValue):", signatureValue)
+	
+	// Actualizar hashes en BD
+	docRepo.UpdateHashes(documentID, digest, signatureValue)
+	auditRepo.CreateLog(documentID, repository.ActionSigned, "XML firmado digitalmente", r.RemoteAddr)
 	// Paso 3: Comprimir ZIP
 	var zipPath string
 	zipParam := r.URL.Query().Get("zip")
@@ -134,6 +175,25 @@ func manerjarDocumento(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Println("PASO 5 y 6: CDR recibido.")
 
+	// Actualizar estado en BD según respuesta SUNAT
+	var estadoDB string
+	switch cdrInfo.Estado {
+	case "aprobada":
+		estadoDB = models.StatusApproved
+		auditRepo.CreateLog(documentID, repository.ActionApproved, "Documento aprobado por SUNAT", r.RemoteAddr)
+	case "rechazada":
+		estadoDB = models.StatusRejected
+		auditRepo.CreateLog(documentID, repository.ActionRejected, "Documento rechazado por SUNAT", r.RemoteAddr)
+	case "observada":
+		estadoDB = models.StatusObserved
+		auditRepo.CreateLog(documentID, repository.ActionError, "Documento observado por SUNAT", r.RemoteAddr)
+	default:
+		estadoDB = models.StatusError
+		auditRepo.CreateLog(documentID, repository.ActionError, "Error en respuesta SUNAT", r.RemoteAddr)
+	}
+	
+	docRepo.UpdateStatus(documentID, estadoDB, cdrInfo.ResponseCode, cdrInfo.Description)
+
 	// Leer archivos para incluir en respuesta
 	xmlContent, _ := ioutil.ReadFile(nombreXML)
 	xmlBase64 := base64.StdEncoding.EncodeToString(xmlContent)
@@ -145,8 +205,9 @@ func manerjarDocumento(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("Warning: No se pudo generar PDF: %v\n", err)
 	}
 	
-	// Crear URL del PDF y ID del documento
-	documentID := fmt.Sprintf("%s-%s-%s-%s", documento.Emisor.RUC, documento.TipoDocumento, documento.Serie, documento.Numero)
+	// Actualizar rutas de archivos en BD
+	docRepo.UpdateFilePaths(documentID, nombreXML, pdfPath, cdrInfo.CDRZipPath, zipPath)
+	
 	pdfURL := fmt.Sprintf("http://%s:%s/api/v1/documents/%s/pdf", appConfig.Server.Host, appConfig.Server.Port, documentID)
 	
 	// Preparar respuesta según requerimientos
@@ -222,13 +283,44 @@ func servirXML(w http.ResponseWriter, r *http.Request, documentID string) {
 	http.ServeFile(w, r, xmlPath)
 }
 
-// consultarEstado consulta el estado del documento (placeholder)
+// consultarEstado consulta el estado del documento desde la BD
 func consultarEstado(w http.ResponseWriter, r *http.Request, documentID string) {
-	// Por ahora retorna un estado simple
+	// Buscar documento en la base de datos
+	doc, err := docRepo.GetByID(documentID)
+	if err != nil {
+		http.Error(w, "Documento no encontrado", http.StatusNotFound)
+		return
+	}
+	
+	// Obtener logs de auditoría
+	logs, _ := auditRepo.GetLogsByDocumentID(documentID)
+	
 	status := map[string]interface{}{
-		"document_id": documentID,
-		"status":      "processed",
-		"message":     "Documento procesado correctamente",
+		"document_id":    doc.ID,
+		"ruc":           doc.RUC,
+		"tipo_documento": doc.TipoDoc,
+		"serie":         doc.Serie,
+		"numero":        doc.Numero,
+		"cliente":       doc.Cliente,
+		"total":         doc.Total,
+		"moneda":        doc.Moneda,
+		"estado":        doc.Estado,
+		"codigo_sunat":  doc.CodigoSUNAT,
+		"mensaje_sunat": doc.MensajeSUNAT,
+		"created_at":    doc.CreatedAt,
+		"updated_at":    doc.UpdatedAt,
+		"processed_at":  doc.ProcessedAt,
+		"files": map[string]string{
+			"xml": doc.XMLPath,
+			"pdf": doc.PDFPath,
+			"cdr": doc.CDRPath,
+			"zip": doc.ZIPPath,
+		},
+		"hashes": map[string]string{
+			"sha1": doc.HashSHA1,
+			"rsa":  doc.HashRSA,
+		},
+		"audit_logs": logs,
 	}
 	
 	w.Header().Set("Content-Type", "application/json")
